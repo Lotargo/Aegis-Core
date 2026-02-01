@@ -3,6 +3,7 @@ import grpc
 import httpx
 import asyncio
 import json
+import uuid
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import PlainTextResponse
@@ -32,7 +33,6 @@ async def wait_for_grpc_server():
     for attempt in range(max_retries):
         try:
             request = aegis_pb2.HealthCheckRequest()
-            # Используем await для асинхронного вызова
             response = await stub.HealthCheck(request, timeout=1)
             if response.status == aegis_pb2.HealthCheckResponse.ServingStatus.SERVING:
                 print("Core A: gRPC сервер Core B готов.")
@@ -42,26 +42,29 @@ async def wait_for_grpc_server():
             await asyncio.sleep(retry_delay)
     return False
 
-@app.on_event("startup")
-async def startup_event():
+async def perform_handshake():
     """
-    При старте сначала дожидается готовности gRPC сервера Core B,
-    а затем получает публичный ключ.
+    Выполняет обмен ключами с Core B.
     """
-    if not await wait_for_grpc_server():
-        print("Core A: Не удалось подключиться к gRPC серверу Core B.")
-        return
-
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(f"{CORE_B_HTTP_URL}/public-key", timeout=5.0)
             response.raise_for_status()
             peer_public_key_bytes = response.content
             app.state.session_key = crypto.derive_shared_key(peer_public_key_bytes)
-            print("Core A: Сессионный ключ успешно создан.")
+            print("Core A: Сессионный ключ успешно создан (обновлен).")
+            return True
         except httpx.RequestError as e:
             print(f"Core A: Не удалось получить ключ от Core B: {e}")
             app.state.session_key = None
+            return False
+
+@app.on_event("startup")
+async def startup_event():
+    if not await wait_for_grpc_server():
+        print("Core A: Не удалось подключиться к gRPC серверу Core B.")
+        return
+    await perform_handshake()
 
 @app.get("/health")
 def health_check():
@@ -70,40 +73,76 @@ def health_check():
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def proxy_request(request: Request, path: str):
     if not app.state.session_key:
-        return PlainTextResponse("Core A is not ready: session key is not established.", status_code=503)
+        # Try to reconnect if key is missing
+        if not await perform_handshake():
+             return PlainTextResponse("Core A is not ready: session key establishment failed.", status_code=503)
 
     session_key = app.state.session_key
 
-    full_path = f"/{path}?{request.url.query}"
+    # --- MTD: Path Hiding ---
+    # We move real path/method inside the encrypted payload.
+    # The 'metadata' sent in cleartext will contain fake or empty values.
+
+    full_path = f"/{path}?{request.url.query}" if request.url.query else f"/{path}"
     headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
     body = await request.body()
 
-    payload_to_encrypt = { "headers": headers, "body": body.decode("utf-8", "ignore") }
+    payload_to_encrypt = {
+        "method": request.method,
+        "path": full_path,
+        "headers": headers,
+        "body": body.decode("utf-8", "ignore")
+    }
     payload_bytes = json.dumps(payload_to_encrypt).encode()
 
-    associated_data = json.dumps({ "method": request.method, "path": full_path }).encode()
+    # Minimal Associated Data (could be a request ID or timestamp)
+    # MUST match what Core B expects.
+    request_metadata = {"trace_id": str(uuid.uuid4())}
+    associated_data = json.dumps(request_metadata).encode()
 
     encrypted_payload = crypto.encrypt(session_key, payload_bytes, associated_data)
 
     aegis_req = aegis_pb2.AegisRequest(
         encrypted_payload=encrypted_payload,
         public_key=crypto.public_key_bytes,
-        metadata={ "method": request.method, "path": full_path }
+        metadata=request_metadata
     )
 
     try:
-        # Используем await для асинхронного вызова
         aegis_res = await stub.Process(aegis_req)
+    except grpc.aio.AioRpcError as e:
+        # --- MTD: Auto-Reconnection ---
+        if e.code() == grpc.StatusCode.UNAUTHENTICATED:
+            print("Core A: Session expired. Renewing key...")
+            if await perform_handshake():
+                # Retry with new key
+                session_key = app.state.session_key
+                encrypted_payload = crypto.encrypt(session_key, payload_bytes, associated_data)
+                aegis_req.encrypted_payload = encrypted_payload
+                try:
+                     aegis_res = await stub.Process(aegis_req)
+                except grpc.aio.AioRpcError as e2:
+                     return PlainTextResponse(f"gRPC Retry Error: {e2.details()}", status_code=503)
+            else:
+                 return PlainTextResponse("Session renewal failed.", status_code=503)
+        else:
+            return PlainTextResponse(f"gRPC Error: {e.details()}", status_code=503)
 
-        response_ad = json.dumps(dict(aegis_res.metadata)).encode()
+    # --- MTD: Deception Handling ---
+    # We completely IGNORE aegis_res.fake_http_status
+    # We trust only the inner encrypted payload.
 
+    response_ad = json.dumps(dict(aegis_res.metadata)).encode()
+
+    try:
         decrypted_response_payload = crypto.decrypt(session_key, aegis_res.encrypted_payload, response_ad)
         response_data = json.loads(decrypted_response_payload)
+    except Exception as e:
+         print(f"Decryption error on response: {e}")
+         return PlainTextResponse("Secure Channel Error: Bad Response", status_code=502)
 
-        return Response(
-            content=response_data["body"],
-            status_code=response_data["status_code"],
-            headers=response_data["headers"],
-        )
-    except grpc.aio.AioRpcError as e:
-        return PlainTextResponse(f"gRPC Error: {e.details()}", status_code=503)
+    return Response(
+        content=response_data["body"],
+        status_code=response_data["status_code"],
+        headers=response_data["headers"],
+    )

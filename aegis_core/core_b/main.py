@@ -4,6 +4,8 @@ import httpx
 import asyncio
 from concurrent import futures
 import json
+import time
+import random
 
 from fastapi import FastAPI, Response
 
@@ -14,10 +16,11 @@ from ..crypto import CryptoEngine
 # --- Конфигурация ---
 TARGET_APP_URL = os.getenv("TARGET_APP_URL", "http://localhost:8081")
 GRPC_PORT = int(os.getenv("GRPC_PORT", 50052))
+SESSION_TTL = int(os.getenv("SESSION_TTL", 600))  # 10 minutes default
 
 # --- Крипто-движок и управление сессиями ---
 crypto = CryptoEngine()
-session_keys = {}
+session_store = {}  # { public_key_pem: { "key": key, "created_at": timestamp } }
 
 # --- gRPC Сервис ---
 class AegisGatewayServicer(aegis_pb2_grpc.AegisGatewayServicer):
@@ -28,24 +31,51 @@ class AegisGatewayServicer(aegis_pb2_grpc.AegisGatewayServicer):
     async def Process(self, request: aegis_pb2.AegisRequest, context):
         client_pub_key_pem = request.public_key
 
-        if client_pub_key_pem not in session_keys:
+        current_time = time.time()
+
+        # Session Management & Expiration
+        if client_pub_key_pem not in session_store:
             session_key = crypto.derive_shared_key(client_pub_key_pem)
-            session_keys[client_pub_key_pem] = session_key
+            session_store[client_pub_key_pem] = {
+                "key": session_key,
+                "created_at": current_time
+            }
         else:
-            session_key = session_keys[client_pub_key_pem]
+            session_data = session_store[client_pub_key_pem]
+            if current_time - session_data["created_at"] > SESSION_TTL:
+                # Session Expired
+                del session_store[client_pub_key_pem]
+                await context.abort(grpc.StatusCode.UNAUTHENTICATED, "Session expired. Please re-handshake.")
+                return
+            session_key = session_data["key"]
 
         try:
-            method = request.metadata.get("method")
-            path = request.metadata.get("path")
-            associated_data = json.dumps({ "method": method, "path": path }).encode()
+            # We now expect associated_data to be empty or minimal,
+            # as real path/method are inside the encrypted payload for obfuscation.
+            # However, to keep backward compatibility or AD check, we use an empty dict or specific Context ID.
+            # Let's assume AD is fixed to "{}" for now or passed from client.
+            # The client sends associated_data based on what it signed.
+            # If client sends metadata, we use it for AD, but NOT for routing.
+
+            # Extract metadata for AD verification only
+            ad_dict = dict(request.metadata)
+            associated_data = json.dumps(ad_dict).encode()
 
             decrypted_payload = crypto.decrypt(session_key, request.encrypted_payload, associated_data)
-
             payload_data = json.loads(decrypted_payload)
-            headers = payload_data['headers']
-            body = payload_data['body'].encode()
+
+            # Routing info is now INSIDE the encrypted envelope
+            method = payload_data.get('method')
+            path = payload_data.get('path')
+            headers = payload_data.get('headers')
+            body = payload_data.get('body').encode()
+
+            if not method or not path:
+                 raise ValueError("Missing routing information in encrypted payload")
 
         except Exception as e:
+            # If decryption fails, we return a generic error or deception
+            print(f"Decryption/Processing error: {e}")
             return aegis_pb2.AegisResponse(fake_http_status=400)
 
         async with httpx.AsyncClient() as client:
@@ -64,8 +94,15 @@ class AegisGatewayServicer(aegis_pb2_grpc.AegisGatewayServicer):
 
                 encrypted_response = crypto.encrypt(session_key, response_payload_bytes, response_ad)
 
+                # Active Deception: Randomize the outer status code
+                # 50% chance of being honest, 50% chance of lying
+                if random.choice([True, False]):
+                    fake_status = response.status_code
+                else:
+                    fake_status = random.choice([200, 404, 503, 403, 500])
+
                 return aegis_pb2.AegisResponse(
-                    fake_http_status=200,
+                    fake_http_status=fake_status,
                     encrypted_payload=encrypted_response,
                     metadata=response_metadata
                 )

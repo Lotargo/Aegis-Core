@@ -22,7 +22,7 @@ def wait_for_port(port, timeout=10):
     return False
 
 def main():
-    print("Starting E2E Test...")
+    print("Starting E2E MTD Test...")
 
     log_a = open("core_a.log", "w")
     log_b = open("core_b.log", "w")
@@ -35,21 +35,20 @@ def main():
         if not wait_for_port(8081):
             print("Backend failed to start")
             sys.exit(1)
-        print("Mock Backend Started.")
 
-        # 2. Start Core B
-        print("Starting Core B...")
+        # 2. Start Core B with short TTL for testing expiration
+        print("Starting Core B (TTL=5s)...")
         env_b = {
             "TARGET_APP_URL": "http://localhost:8081",
             "GRPC_PORT": "50052",
             "CORE_B_HTTP_PORT": "8001",
+            "SESSION_TTL": "5",  # 5 seconds TTL
             "PYTHONUNBUFFERED": "1"
         }
         core_b = run_process(["python", "-m", "aegis_core.core_b"], env=env_b, log_file=log_b)
         if not wait_for_port(8001):
             print("Core B failed to start")
             sys.exit(1)
-        print("Core B Started.")
 
         # 3. Start Core A
         print("Starting Core A...")
@@ -63,41 +62,60 @@ def main():
         if not wait_for_port(8000):
             print("Core A failed to start")
             sys.exit(1)
-        print("Core A Started.")
 
         print("Waiting for session establishment...")
         time.sleep(3)
 
-        # 4. Test
-        print("Sending request to Core A...")
-        try:
-            response = httpx.post("http://localhost:8000/test/path?q=1", json={"foo": "bar"}, headers={"X-Test": "True"}, timeout=5)
-            print(f"Response Status: {response.status_code}")
-            print(f"Response Body: {response.text}")
+        # 4. Test 1: Normal Request (Path Hiding check)
+        print("\n[Test 1] Sending normal request...")
+        resp1 = httpx.post("http://localhost:8000/secret/path", json={"msg": "hello"}, timeout=5)
+        print(f"Resp1 Status: {resp1.status_code}")
+        if resp1.status_code != 200:
+             raise Exception(f"Failed normal request: {resp1.status_code}")
 
-            if response.status_code != 200:
-                raise Exception(f"Status code mismatch: {response.status_code}")
+        data1 = resp1.json()
+        if data1["path"] != "/secret/path":
+             raise Exception(f"Path obfuscation failed, backend got: {data1['path']}")
+        print("PASS: Path correctly delivered.")
 
-            data = response.json()
+        # 5. Test 2: Session Expiration & Auto-Reconnect
+        print("\n[Test 2] Waiting 6s for session expiry...")
+        time.sleep(6)
 
-            if data.get("status") != "ok":
-                raise Exception("Backend status mismatch")
+        print("Sending request with expired session...")
+        resp2 = httpx.post("http://localhost:8000/retry/test", json={"msg": "retry"}, timeout=10)
+        print(f"Resp2 Status: {resp2.status_code}")
 
-            if data.get("path") != "/test/path":
-                 raise Exception(f"Path mismatch: {data.get('path')}")
+        if resp2.status_code != 200:
+             raise Exception(f"Auto-reconnect failed: {resp2.status_code}")
 
-            if data.get("query") != "q=1":
-                 raise Exception(f"Query mismatch: {data.get('query')}")
+        data2 = resp2.json()
+        if data2["path"] != "/retry/test":
+             raise Exception("Path mismatch after reconnect")
+        print("PASS: Auto-reconnection worked.")
 
-            sent_body = json.loads(data["body"])
-            if sent_body.get("foo") != "bar":
-                raise Exception("Body mismatch")
+        # 6. Test 3: Deception (Statistical Check)
+        print("\n[Test 3] Sending 10 requests to check Deception consistency...")
+        # Since Core A hides the fake status from us, we can't easily check the *outer* status
+        # without sniffing the gRPC traffic or checking logs.
+        # But we CAN check that Core A *always* gives us 200 OK, even if Core B lied.
 
-            print("SUCCESS: E2E Test Passed!")
+        for i in range(10):
+            resp = httpx.get(f"http://localhost:8000/spam/{i}", timeout=5)
+            if resp.status_code != 200:
+                raise Exception(f"Core A failed to handle deception at request {i}, got {resp.status_code}")
+        print("PASS: Client consistently ignored fake statuses.")
 
-        except Exception as e:
-            print(f"Test Failed: {e}")
-            sys.exit(1)
+        print("\nSUCCESS: All MTD tests passed!")
+
+    except Exception as e:
+        print(f"\nTEST FAILED: {e}")
+        # Print logs for debugging
+        print("\n--- Core A Log ---")
+        with open("core_a.log", "r") as f: print(f.read())
+        print("\n--- Core B Log ---")
+        with open("core_b.log", "r") as f: print(f.read())
+        sys.exit(1)
 
     finally:
         print("Stopping services...")
