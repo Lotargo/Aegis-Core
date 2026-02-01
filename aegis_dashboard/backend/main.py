@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -7,6 +7,7 @@ import zipfile
 import io
 import yaml
 import os
+import httpx
 
 app = FastAPI(title="Aegis Dashboard API")
 
@@ -114,6 +115,20 @@ It forwards traffic securely to Core B, which sends it to {config.backend_url}.
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/metrics")
+async def proxy_metrics(target: str = Query(..., description="Target Core B URL, e.g., http://localhost:8001")):
+    """
+    Proxy metrics from Core B to Frontend to avoid CORS issues.
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            # Append /metrics if not present
+            url = f"{target}/metrics"
+            resp = await client.get(url, timeout=2.0)
+            return Response(content=resp.text, media_type="text/plain")
+    except Exception as e:
+        return Response(content=f"# Error fetching metrics: {str(e)}", media_type="text/plain", status_code=502)
 
 # Serve Frontend Static Files (Must be last to avoid overriding API routes)
 if os.path.exists("/app/static"):

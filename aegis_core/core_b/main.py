@@ -8,6 +8,7 @@ import time
 import random
 
 from fastapi import FastAPI, Response
+from prometheus_client import Counter, Gauge, generate_latest, CONTENT_TYPE_LATEST
 
 from .. import aegis_pb2_grpc
 from .. import aegis_pb2
@@ -17,6 +18,12 @@ from ..crypto import CryptoEngine
 TARGET_APP_URL = os.getenv("TARGET_APP_URL", "http://localhost:8081")
 GRPC_PORT = int(os.getenv("GRPC_PORT", 50052))
 SESSION_TTL = int(os.getenv("SESSION_TTL", 600))  # 10 minutes default
+
+# --- Metrics ---
+AEGIS_REQUESTS_TOTAL = Counter('aegis_requests_total', 'Total Aegis requests', ['status'])
+AEGIS_DECEPTION_EVENTS = Counter('aegis_deception_events', 'Number of deceptive responses', ['fake_status'])
+AEGIS_ACTIVE_SESSIONS = Gauge('aegis_active_sessions', 'Number of active crypto sessions')
+AEGIS_CRYPTO_ERRORS = Counter('aegis_crypto_errors', 'Decryption or crypto validation errors')
 
 # --- Крипто-движок и управление сессиями ---
 crypto = CryptoEngine()
@@ -40,23 +47,18 @@ class AegisGatewayServicer(aegis_pb2_grpc.AegisGatewayServicer):
                 "key": session_key,
                 "created_at": current_time
             }
+            AEGIS_ACTIVE_SESSIONS.inc()
         else:
             session_data = session_store[client_pub_key_pem]
             if current_time - session_data["created_at"] > SESSION_TTL:
                 # Session Expired
                 del session_store[client_pub_key_pem]
+                AEGIS_ACTIVE_SESSIONS.dec()
                 await context.abort(grpc.StatusCode.UNAUTHENTICATED, "Session expired. Please re-handshake.")
                 return
             session_key = session_data["key"]
 
         try:
-            # We now expect associated_data to be empty or minimal,
-            # as real path/method are inside the encrypted payload for obfuscation.
-            # However, to keep backward compatibility or AD check, we use an empty dict or specific Context ID.
-            # Let's assume AD is fixed to "{}" for now or passed from client.
-            # The client sends associated_data based on what it signed.
-            # If client sends metadata, we use it for AD, but NOT for routing.
-
             # Extract metadata for AD verification only
             ad_dict = dict(request.metadata)
             associated_data = json.dumps(ad_dict, sort_keys=True).encode()
@@ -76,6 +78,8 @@ class AegisGatewayServicer(aegis_pb2_grpc.AegisGatewayServicer):
         except Exception as e:
             # If decryption fails, we return a generic error or deception
             print(f"Decryption/Processing error: {e}")
+            AEGIS_CRYPTO_ERRORS.inc()
+            AEGIS_REQUESTS_TOTAL.labels(status="crypto_error").inc()
             return aegis_pb2.AegisResponse(fake_http_status=400)
 
         async with httpx.AsyncClient() as client:
@@ -96,10 +100,14 @@ class AegisGatewayServicer(aegis_pb2_grpc.AegisGatewayServicer):
 
                 # Active Deception: Randomize the outer status code
                 # 50% chance of being honest, 50% chance of lying
-                if random.choice([True, False]):
+                is_deception = random.choice([True, False])
+                if not is_deception:
                     fake_status = response.status_code
+                    AEGIS_REQUESTS_TOTAL.labels(status="success_honest").inc()
                 else:
                     fake_status = random.choice([200, 404, 503, 403, 500])
+                    AEGIS_DECEPTION_EVENTS.labels(fake_status=str(fake_status)).inc()
+                    AEGIS_REQUESTS_TOTAL.labels(status="success_deceptive").inc()
 
                 return aegis_pb2.AegisResponse(
                     fake_http_status=fake_status,
@@ -108,10 +116,15 @@ class AegisGatewayServicer(aegis_pb2_grpc.AegisGatewayServicer):
                 )
 
             except httpx.RequestError as e:
+                AEGIS_REQUESTS_TOTAL.labels(status="upstream_error").inc()
                 return aegis_pb2.AegisResponse(fake_http_status=500, encrypted_payload=str(e).encode())
 
 # --- Приложение FastAPI ---
 app = FastAPI(title="Aegis Core B")
+
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 @app.get("/public-key")
 def get_public_key():
