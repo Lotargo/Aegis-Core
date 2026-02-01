@@ -18,17 +18,17 @@ The traffic flows transparently from the Client Application (App A) through the 
 ```mermaid
 graph LR
     subgraph Client_Side
-        AppA[Client App (App A)]
+        AppA["Client App (App A)"]
         CoreA[Aegis Core A]
     end
 
     subgraph Server_Side
         CoreB[Aegis Core B]
-        AppB[Server App (App B)]
+        AppB["Server App (App B)"]
     end
 
     AppA -- HTTP/1.1 --> CoreA
-    CoreA -- Proteus Protocol (gRPC/HTTP2) --> CoreB
+    CoreA -- "Proteus Protocol (gRPC/HTTP2)" --> CoreB
     CoreB -- HTTP/1.1 --> AppB
 
     AppB -.-> CoreB
