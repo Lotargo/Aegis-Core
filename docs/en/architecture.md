@@ -1,78 +1,41 @@
-# Aegis Core Architecture
+# Architecture & MTD Implementation
 
 ## Overview
 
-Aegis Core is a proactive security gateway designed to protect API interactions between client and server applications. It operates as a pair of proxies, implementing "Moving Target Defense" and "Cyber Deception" principles to mask the true nature of the API infrastructure.
+Aegis Core is a security gateway designed around the principle of **Moving Target Defense (MTD)**. Instead of relying on static defenses, it constantly changes the attack surface to invalidate attacker reconnaissance.
 
-## System Components
+## Component Interaction
 
-The system consists of two main components acting as a transparent "man-in-the-middle" proxy gateway:
+### 1. The Secure Channel (Proteus Protocol)
 
-*   **Aegis Core A (Encryptor Proxy):** Deployed on the client side. Intercepts outgoing HTTP requests, encrypts, and obfuscates them before transmitting over the secure channel.
-*   **Aegis Core B (Decryptor Proxy):** Deployed on the server side. Receives obfuscated requests, decrypts, validates, and forwards them to the target application.
+The communication between Core A (Client) and Core B (Server) is not standard HTTP. It is a custom gRPC tunnel where:
+*   **Transport Layer:** gRPC / HTTP2
+*   **Encryption:** AES-256-GCM with per-session keys.
+*   **Integrity:** HMAC-SHA256 signatures.
 
-## Data Flow
+### 2. Path Obfuscation (The "Invisible API")
 
-The traffic flows transparently from the Client Application (App A) through the Aegis proxies to the Server Application (App B) and back.
+In a standard API call:
+`GET /api/v1/users/123`
 
-```mermaid
-graph LR
-    subgraph Client_Side
-        AppA["Client App (App A)"]
-        CoreA[Aegis Core A]
-    end
+In Aegis Core:
+1.  Core A receives the request.
+2.  It takes the method (`GET`) and path (`/api/v1/users/123`), puts them into a JSON object, and **encrypts** them.
+3.  The outer gRPC request is sent with a generic metadata trace ID: `Trace-ID: <random-uuid>`.
+4.  **Wire Result:** An attacker sniffing the network sees a gRPC packet going to `AegisGateway/Process`. They have zero visibility into which REST endpoint is actually being called.
 
-    subgraph Server_Side
-        CoreB[Aegis Core B]
-        AppB["Server App (App B)"]
-    end
+### 3. Cyber Deception (The "Lying Server")
 
-    AppA -- HTTP/1.1 --> CoreA
-    CoreA -- "Proteus Protocol (gRPC/HTTP2)" --> CoreB
-    CoreB -- HTTP/1.1 --> AppB
+To disrupt automated scanners, Core B implements a **Deception Engine**:
+1.  Core B processes the request successfully and gets a `200 OK` from the backend.
+2.  It encrypts the real response.
+3.  It generates a **Fake Status Code** for the outer envelope.
+    *   Example: It wraps the `200 OK` payload inside a `503 Service Unavailable` gRPC response.
+4.  **Network View:** The attacker sees a `503` error and assumes the exploit failed.
+5.  **Client View:** Core A ignores the `503`, decrypts the payload, finds the real `200 OK`, and returns it to the application.
 
-    AppB -.-> CoreB
-    CoreB -.-> CoreA
-    CoreA -.-> AppA
-```
+### 4. Session Management (Key Rotation)
 
-## Proteus Protocol
-
-The communication between Core A and Core B uses the custom **Proteus Protocol**, built on top of gRPC and Protocol Buffers. This protocol ensures confidentiality, integrity, and obfuscation.
-
-### Key Features
-
-1.  **Session Encryption:** Uses **AES-256-GCM** for authenticated encryption of the payload.
-2.  **Key Exchange:** secure **ECDH (Elliptic-curve Diffie–Hellman)** key exchange to generate ephemeral session keys.
-3.  **Endpoint Obfuscation:** The actual API endpoints (e.g., `/api/users`) are masked into dynamic, encrypted paths.
-4.  **Protocol Camouflage:** Responses can be camouflaged. A successful `200 OK` response might be wrapped in a `503 Service Unavailable` envelope to mislead traffic analyzers.
-
-### Request Structure (AegisRequest)
-
-*   `encrypted_endpoint`: The encrypted URL path.
-*   `encrypted_payload`: The encrypted body of the request.
-*   `metadata`: Headers and other meta-information.
-*   `signature`: HMAC signature for integrity verification.
-
-### Response Structure (AegisResponse)
-
-*   `fake_http_status`: Camouflaged HTTP status code.
-*   `encrypted_payload`: The actual encrypted response (containing real status and body).
-*   `rotor_sync_position`: Position for the internal state synchronization ("rotor").
-*   `signature`: HMAC signature.
-
-## Security Modules (Core B)
-
-Aegis Core B acts as the gatekeeper and implements a multi-layered Zero-Trust filter:
-
-1.  **Web Application Firewall (WAF):** Analyzes decrypted payloads for SQLi, XSS, and Command Injection patterns.
-2.  **Rate Limiter:** Limits request rates based on client ID (IP or API key) using Redis.
-3.  **Schema Validation:** Validates decrypted requests against a defined OpenAPI 3.x specification. Invalid requests are rejected before reaching the target application.
-
-## Technology Stack
-
-*   **Core:** Python 3.10+, FastAPI (ASGI)
-*   **Transport:** gRPC, Protocol Buffers
-*   **Cryptography:** `cryptography` library (AES-GCM, ECDH, HMAC-SHA256)
-*   **Infrastructure:** Docker, Kubernetes
-*   **Logging:** ELK Stack (Elasticsearch, Logstash, Kibana)
+*   **Handshake:** ECDH (Elliptic-curve Diffie–Hellman) is used to establish a shared secret.
+*   **TTL (Time-To-Live):** Every session in Core B has a strict lifetime (defined by `SESSION_TTL`, default 10 mins).
+*   **Auto-Renewal:** When a key expires, Core B returns an `UNAUTHENTICATED` error. Core A catches this, instantly performs a new handshake, and retries the original request. This happens transparently to the user.

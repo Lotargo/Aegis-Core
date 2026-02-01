@@ -1,82 +1,42 @@
 # Technical Specification
 
-**Version:** 1.0
-**Date:** October 28, 2025
+## Protocol Definition (Proteus)
 
----
+The communication is defined by `proto/aegis.proto`.
 
-## 1. General Provisions
+### AegisRequest
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `encrypted_payload` | `bytes` | Contains the JSON-serialized `method`, `path`, `headers`, and `body`. Encrypted with AES-256-GCM. |
+| `metadata` | `map<string, string>` | **DEPRECATED for routing.** Only contains non-sensitive tracing data (e.g., `trace_id`). |
+| `public_key` | `bytes` | The client's ephemeral public key (PEM format) to identify the session. |
 
-### 1.1 Project Name
-Proactive API Protection System "Aegis Core".
+### AegisResponse
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `fake_http_status` | `int32` | A randomized HTTP status code (200, 403, 404, 500, 503) used for deception. **MUST be ignored by the client.** |
+| `encrypted_payload` | `bytes` | Contains the real `status_code`, `headers`, and `body`. |
+| `metadata` | `map<string, string>` | Response tracing metadata. |
 
-### 1.2 Terms and Definitions
-*   **Aegis Core System:** A software complex consisting of two proxy components ensuring secure network interaction.
-*   **Aegis Core A (Encryptor Proxy):** Client-side component. Intercepts, encrypts, and obfuscates requests.
-*   **Aegis Core B (Decryptor Proxy):** Server-side component. Decrypts, validates, and forwards requests.
-*   **Proteus Protocol:** Internal secure communication protocol between Aegis Core A and B.
+## Environment Variables
 
-## 2. Goals and Objectives
+### Common
+*   `LOG_LEVEL`: `DEBUG`, `INFO`, `WARNING`, `ERROR` (Default: `INFO`)
 
-### 2.1 Goals
-Create a universal, high-performance security gateway implementing "Moving Target Defense" and "Cyber Deception" principles to protect APIs from modern threats without modifying target application code.
+### Core A (Client Proxy)
+*   `CORE_A_HOST`: Interface to bind (Default: `0.0.0.0`)
+*   `CORE_A_PORT`: Port to listen on (Default: `8000`)
+*   `CORE_B_GRPC_TARGET`: Host:Port of Core B gRPC server (Default: `localhost:50051`)
+*   `CORE_B_HTTP_URL`: URL of Core B HTTP server (for initial handshake) (Default: `http://localhost:8001`)
 
-### 2.2 Objectives
-1.  Develop `Aegis Core A` and `Aegis Core B` components.
-2.  Implement the secure "Proteus" protocol based on gRPC and Protocol Buffers.
-3.  Integrate a cryptographic core for dynamic endpoint and payload encryption.
-4.  Implement protocol camouflage to mask legitimate traffic.
-5.  Integrate multi-level security filters (WAF, Rate Limiting, Schema Validation) in Core B.
-6.  Ensure centralized logging integrated with ELK stack.
-7.  Prepare the system for containerized deployment (Docker, Kubernetes).
+### Core B (Server Gateway)
+*   `CORE_B_GRPC_PORT`: gRPC listening port (Default: `50051`)
+*   `CORE_B_HTTP_PORT`: HTTP listening port for handshake (Default: `8001`)
+*   `TARGET_APP_URL`: The backend URL to proxy to (Default: `http://localhost:8080`)
+*   `SESSION_TTL`: Session validity duration in seconds (Default: `600`)
+*   `REDIS_URL`: Redis URL for Rate Limiting (Default: `redis://localhost:6379`)
 
-## 3. Functional Requirements
-
-### 3.1 Proxy Core (FastAPI)
-1.  Both components must function as asynchronous ASGI applications.
-2.  `Aegis Core A` accepts standard HTTP/1.1 requests.
-3.  `Aegis Core B` forwards restored requests to the target app via HTTP/1.1.
-4.  Correct proxying of HTTP headers (excluding connection-specific ones).
-5.  Configurable timeout logic for all external connections.
-
-### 3.2 Proteus Protocol (gRPC + Protobuf)
-1.  **Data Contract:**
-    *   **AegisRequest:** Contains encrypted endpoint, payload, metadata, and HMAC signature.
-    *   **AegisResponse:** Contains fake HTTP status, encrypted payload (with real response), rotor sync position, and signature.
-2.  **Cryptography:**
-    *   **Key Exchange:** ECDH for session key generation.
-    *   **Encryption:** AES-256-GCM for all payloads.
-    *   **Obfuscation:** Deterministic URL path obfuscation based on session key and internal state.
-    *   **Integrity:** HMAC signature for every message.
-
-### 3.3 Security Modules (Aegis Core B)
-1.  **WAF:** Analyzes decrypted content for SQLi, XSS, Command Injection. Configurable rules (e.g., OWASP CRS).
-2.  **Rate Limiter:** Limits requests based on client ID. Uses Redis backend.
-3.  **Schema Validation:** Validates requests against OpenAPI 3.x spec. Rejects invalid requests with `400 Bad Request` (masked by Proteus).
-
-### 3.4 Configuration
-1.  Configurable via environment variables or YAML.
-2.  Key parameters: Listen addresses, target service address, remote Aegis Core address, Redis/ELK connection, WAF rules path, Log level.
-
-### 3.5 Logging and Monitoring
-1.  Structured JSON logging to stdout.
-2.  Events: `AEGIS_REQUEST_BLOCKED`, `AEGIS_DECRYPTION_FAILED`, `AEGIS_SIGNATURE_INVALID`.
-3.  Prometheus metrics endpoint (`/metrics`): Request counts, latency histograms.
-
-## 4. Non-Functional Requirements
-
-### 4.1 Performance
-1.  Overhead should not exceed **50ms** at the 95th percentile.
-2.  One instance should handle at least **1000 RPS** on standard hardware (2 vCPU, 4GB RAM).
-
-### 4.2 Reliability
-1.  Target availability: **99.95%**.
-2.  Automatic reconnection and secure channel re-establishment.
-
-### 4.3 Scalability
-Horizontal scaling support behind a load balancer.
-
-### 4.4 Security
-1.  No hardcoded secrets.
-2.  Regular dependency scanning.
-3.  Non-privileged user execution in containers.
+## Security Constraints
+1.  **Replay Attacks:** Mitigated by Session Keys and gRPC nonces.
+2.  **Man-in-the-Middle:** Mitigated by ECDH. Note: The initial HTTP handshake is vulnerable if not wrapped in TLS/mTLS in production.
+3.  **Dos:** Mitigated by Rate Limiting (Redis required).
