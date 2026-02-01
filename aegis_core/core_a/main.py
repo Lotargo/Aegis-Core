@@ -98,7 +98,7 @@ async def proxy_request(request: Request, path: str):
     # Minimal Associated Data (could be a request ID or timestamp)
     # MUST match what Core B expects.
     request_metadata = {"trace_id": str(uuid.uuid4())}
-    associated_data = json.dumps(request_metadata).encode()
+    associated_data = json.dumps(request_metadata, sort_keys=True).encode()
 
     encrypted_payload = crypto.encrypt(session_key, payload_bytes, associated_data)
 
