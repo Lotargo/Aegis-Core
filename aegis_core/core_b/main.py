@@ -59,7 +59,7 @@ class AegisGatewayServicer(aegis_pb2_grpc.AegisGatewayServicer):
 
             # Extract metadata for AD verification only
             ad_dict = dict(request.metadata)
-            associated_data = json.dumps(ad_dict).encode()
+            associated_data = json.dumps(ad_dict, sort_keys=True).encode()
 
             decrypted_payload = crypto.decrypt(session_key, request.encrypted_payload, associated_data)
             payload_data = json.loads(decrypted_payload)
