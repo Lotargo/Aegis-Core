@@ -28,6 +28,7 @@ The communication is defined by `proto/aegis.proto`.
 *   `CORE_A_PORT`: Port to listen on (Default: `8000`)
 *   `CORE_B_GRPC_TARGET`: Host:Port of Core B gRPC server (Default: `localhost:50051`)
 *   `CORE_B_HTTP_URL`: URL of Core B HTTP server (for initial handshake) (Default: `http://localhost:8001`)
+*   `MAX_REQUEST_SIZE`: Maximum allowed request body size in bytes (Default: `10485760` / 10MB). Used for DoS protection.
 
 ### Core B (Server Gateway)
 *   `CORE_B_GRPC_PORT`: gRPC listening port (Default: `50051`)
@@ -39,4 +40,5 @@ The communication is defined by `proto/aegis.proto`.
 ## Security Constraints
 1.  **Replay Attacks:** Mitigated by Session Keys and gRPC nonces.
 2.  **Man-in-the-Middle:** Mitigated by ECDH. Note: The initial HTTP handshake is vulnerable if not wrapped in TLS/mTLS in production.
-3.  **Dos:** Mitigated by Rate Limiting (Redis required).
+3.  **DoS (Application Level):** Mitigated by `MAX_REQUEST_SIZE` enforcement in Core A (Content-Length and Stream limits).
+4.  **DoS (Network Level):** Mitigated by Rate Limiting (Redis required).
