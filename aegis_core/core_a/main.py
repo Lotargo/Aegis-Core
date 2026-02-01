@@ -5,7 +5,7 @@ import asyncio
 import json
 import uuid
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.responses import PlainTextResponse
 
 from .. import aegis_pb2_grpc
@@ -15,6 +15,7 @@ from ..crypto import CryptoEngine
 # --- Конфигурация ---
 CORE_B_GRPC_TARGET = os.getenv("CORE_B_GRPC_TARGET", "localhost:50052")
 CORE_B_HTTP_URL = os.getenv("CORE_B_HTTP_URL", "http://localhost:8001")
+MAX_REQUEST_SIZE = int(os.getenv("MAX_REQUEST_SIZE", 10 * 1024 * 1024))  # 10 MB
 
 # --- Приложение и Крипто-движок ---
 app = FastAPI(title="Aegis Core A")
@@ -72,6 +73,25 @@ def health_check():
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def proxy_request(request: Request, path: str):
+    # 1. DoS Protection: Content-Length Check
+    content_length = request.headers.get('content-length')
+    if content_length:
+        try:
+            if int(content_length) > MAX_REQUEST_SIZE:
+                 return Response(content="Payload Too Large", status_code=413)
+        except ValueError:
+            return Response(content="Invalid Content-Length", status_code=400)
+
+    # 2. DoS Protection: Stream Read Check
+    body_chunks = []
+    body_size = 0
+    async for chunk in request.stream():
+        body_size += len(chunk)
+        if body_size > MAX_REQUEST_SIZE:
+             return Response(content="Payload Too Large (Stream)", status_code=413)
+        body_chunks.append(chunk)
+    body = b"".join(body_chunks)
+
     if not app.state.session_key:
         # Try to reconnect if key is missing
         if not await perform_handshake():
@@ -85,7 +105,6 @@ async def proxy_request(request: Request, path: str):
 
     full_path = f"/{path}?{request.url.query}" if request.url.query else f"/{path}"
     headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
-    body = await request.body()
 
     payload_to_encrypt = {
         "method": request.method,
