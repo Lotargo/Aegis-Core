@@ -43,11 +43,12 @@ graph LR
     end
 
     AppA -- HTTP/1.1 --> CoreA
-    CoreA -- Proteus Protocol (Encrypted gRPC) --> CoreB
+    CoreA -- "Proteus Protocol (Encrypted gRPC)" --> CoreB
     CoreB -- HTTP/1.1 --> AppB
 
-    style CoreA fill:#f9f,stroke:#333,stroke-width:2px
-    style CoreB fill:#bbf,stroke:#333,stroke-width:2px
+    %% Стили для Core (Светлый фон, Темный текст)
+    style CoreA fill:#E1BEE7,stroke:#8E24AA,stroke-width:2px,color:#333333
+    style CoreB fill:#BBDEFB,stroke:#1976D2,stroke-width:2px,color:#333333
 ```
 
 *   **Aegis Core A (Encryptor):** Sits next to the client. It intercepts standard HTTP requests, performs an **ECDH key exchange** with Core B, and wraps the request in the secure **Proteus Protocol**. It handles automatic session renewal and extracts real data from deceptive responses.
