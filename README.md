@@ -26,6 +26,23 @@ The system actively lies to unauthorized observers.
 
 ---
 
+## 🎛️ Aegis Control Center (Dashboard)
+
+Aegis Core comes with a GUI dashboard to generate secure deployment configurations effortlessly.
+
+![Aegis Dashboard Preview](docs/dashboard_preview.png)
+
+### Running the Dashboard
+```bash
+# Build and run with Docker
+cd aegis_dashboard
+docker build -t aegis-dashboard .
+docker run -p 8080:8080 aegis-dashboard
+```
+Open [http://localhost:8080](http://localhost:8080) in your browser.
+
+---
+
 ## 🏗️ Architecture
 
 The system operates as a pair of proxies protecting the channel between a Client Application and a Server Application.
